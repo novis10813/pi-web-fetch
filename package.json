@@ -1,7 +1,9 @@
 {
 	"name": "pi-web-fetch",
+	"version": "0.1.0",
 	"private": true,
 	"type": "module",
+	"description": "pi extension: web_fetch tool — fetch a URL and extract readable markdown (HTML via Readability + Turndown, PDF via unpdf, Jina Reader fallback)",
 	"pi": {
 		"extensions": ["./index.ts"]
 	},
