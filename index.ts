@@ -13,6 +13,9 @@ const MAX_PDF_SIZE = 20 * 1024 * 1024;
 const MIN_USEFUL_CONTENT = 500;
 const JINA_READER_BASE = "https://r.jina.ai/";
 const JINA_TIMEOUT_MS = 30000;
+// Threads only embeds post data in the HTML for crawlers.
+const CRAWLER_USER_AGENT =
+	"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
 
 const turndown = new TurndownService({
 	headingStyle: "atx",
@@ -310,6 +313,209 @@ function extractRSCContent(
 	return content.length > 100 ? { title, content } : null;
 }
 
+// ── Threads Extraction ───────────────────────────────────────────────
+
+type Json = Record<string, any>;
+
+function isThreadsPostUrl(url: string): boolean {
+	try {
+		const { hostname, pathname } = new URL(url);
+		return (
+			/(^|\.)threads\.(com|net)$/.test(hostname) &&
+			/\/(post|share)\//.test(pathname)
+		);
+	} catch {
+		return false;
+	}
+}
+
+function quote(text: string): string {
+	return text
+		.split("\n")
+		.map((l) => (l ? `> ${l}` : ">"))
+		.join("\n");
+}
+
+function plural(n: number, one: string, many = `${one}s`): string {
+	return `${n} ${n === 1 ? one : many}`;
+}
+
+function collectThreadsData(html: string): {
+	posts: Json[];
+	threadInfos: { ownerId: unknown; info: Json }[];
+} {
+	const posts: Json[] = [];
+	const threadInfos: { ownerId: unknown; info: Json }[] = [];
+	const walk = (node: unknown): void => {
+		if (Array.isArray(node)) {
+			for (const item of node) walk(item);
+			return;
+		}
+		if (!node || typeof node !== "object") return;
+		const obj = node as Json;
+		if (obj.caption !== undefined && obj.user?.username && obj.code) {
+			posts.push(obj);
+		}
+		const info = obj.text_post_app_info;
+		if (
+			info &&
+			(info.direct_replies || info.self_thread || info.pinned_replies)
+		) {
+			threadInfos.push({ ownerId: obj.id, info });
+		}
+		for (const value of Object.values(obj)) walk(value);
+	};
+
+	const scriptRegex =
+		/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/g;
+	for (const match of html.matchAll(scriptRegex)) {
+		if (!match[1].includes('"caption"')) continue;
+		try {
+			walk(JSON.parse(match[1]));
+		} catch {
+			/* ignore malformed blocks */
+		}
+	}
+	return { posts, threadInfos };
+}
+
+function threadEdgeNodes(connection: Json | undefined): Json[][] {
+	// direct_replies / pinned_replies: edges[].node.posts.edges[].node
+	// The first post of each group is the reply, the rest are its inline sub-replies.
+	return (connection?.edges ?? []).map((edge: Json) =>
+		(edge?.node?.posts?.edges ?? [])
+			.map((e: Json) => e?.node)
+			.filter(Boolean),
+	);
+}
+
+function formatThreadsPost(post: Json): string {
+	const info = post.text_post_app_info ?? {};
+	const meta = [`**@${post.user.username}**`];
+	if (post.taken_at) {
+		meta.push(
+			new Date(post.taken_at * 1000)
+				.toISOString()
+				.slice(0, 16)
+				.replace("T", " ") + " UTC",
+		);
+	}
+	if (typeof post.like_count === "number")
+		meta.push(plural(post.like_count, "like"));
+	if (info.direct_reply_count)
+		meta.push(plural(info.direct_reply_count, "reply", "replies"));
+	if (info.repost_count) meta.push(plural(info.repost_count, "repost"));
+
+	const lines = [meta.join(" · "), "", post.caption?.text?.trim() || ""];
+
+	const media: string[] = [];
+	const addMedia = (m: Json) => {
+		const video = m?.video_versions?.[0]?.url;
+		const image = m?.image_versions2?.candidates?.[0]?.url;
+		if (video) media.push(`- Video: ${video}`);
+		else if (image) media.push(`- Image: ${image}`);
+	};
+	if (Array.isArray(post.carousel_media)) post.carousel_media.forEach(addMedia);
+	else addMedia(post);
+	const link = info.link_preview_attachment?.url;
+	if (link) media.push(`- Link: ${link}`);
+	if (media.length) lines.push("", ...media);
+
+	const quoted = info.share_info?.quoted_post;
+	if (quoted?.user?.username) {
+		lines.push("", quote(formatThreadsPost(quoted)));
+	}
+	return lines.join("\n").trim();
+}
+
+function extractThreadsContent(
+	html: string,
+	pageUrl: string,
+): { title: string; content: string } | null {
+	const code = new URL(pageUrl).pathname.match(/\/post\/([^/?#]+)/)?.[1];
+	if (!code) return null;
+
+	const { posts, threadInfos } = collectThreadsData(html);
+	const main = posts.find((p) => p.code === code);
+	if (!main) return null;
+	// Only use reply data that belongs to the main post.
+	const mainInfos = threadInfos
+		.filter((t) => main.id != null && t.ownerId === main.id)
+		.map((t) => t.info);
+
+	const seen = new Set<string>([main.code]);
+	const fresh = (p: Json) => {
+		if (!p?.code || !p.user?.username || seen.has(p.code)) return false;
+		seen.add(p.code);
+		return true;
+	};
+
+	const selfThread: Json[] = [];
+	const replyGroups: Json[][] = [];
+	for (const info of mainInfos) {
+		for (const e of info.self_thread?.posts?.edges ?? []) {
+			if (fresh(e?.node)) selfThread.push(e.node);
+		}
+	}
+	for (const key of ["pinned_replies", "direct_replies"]) {
+		for (const info of mainInfos) {
+			for (const group of threadEdgeNodes(info[key])) {
+				// Skip the whole group if its head reply was already shown (e.g. pinned).
+				if (!group.length || !fresh(group[0])) continue;
+				replyGroups.push([group[0], ...group.slice(1).filter(fresh)]);
+			}
+		}
+	}
+
+	const sections = [formatThreadsPost(main)];
+	if (selfThread.length) {
+		const [first, ...rest] = selfThread.map(formatThreadsPost);
+		sections.push(`## Thread continuation\n\n${first}`, ...rest);
+	}
+	const total = main.text_post_app_info?.direct_reply_count;
+	const replies = replyGroups.map(([reply, ...subReplies]) =>
+		[
+			formatThreadsPost(reply),
+			...subReplies.map((sub) => quote(formatThreadsPost(sub))),
+		].join("\n\n"),
+	);
+	if (replies.length) {
+		const heading = `## Replies (${replies.length} shown${total ? ` of ${total}` : ""})`;
+		sections.push(`${heading}\n\n${replies[0]}`, ...replies.slice(1));
+	}
+
+	const firstLine = (main.caption?.text || "").split("\n")[0].trim();
+	const title = `@${main.user.username} on Threads${firstLine ? `: ${Array.from(firstLine).slice(0, 80).join("")}` : ""}`;
+	return { title, content: sections.join("\n\n---\n\n") };
+}
+
+async function extractThreads(
+	url: string,
+	signal?: AbortSignal,
+): Promise<FetchResult | null> {
+	try {
+		// The crawler UA also makes /share/ links redirect to the post URL.
+		const res = await fetch(url, {
+			headers: {
+				"User-Agent": CRAWLER_USER_AGENT,
+				"Accept-Language": "en-US,en;q=0.9",
+			},
+			signal: AbortSignal.any([
+				AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+				...(signal ? [signal] : []),
+			]),
+		});
+		if (!res.ok) return null;
+		const result = extractThreadsContent(await res.text(), res.url);
+		if (!result) return null;
+		const finalUrl = new URL(res.url);
+		finalUrl.search = "";
+		return { url: finalUrl.toString(), ...result, error: null };
+	} catch {
+		return null;
+	}
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function isLikelyJSRendered(html: string): boolean {
@@ -517,6 +723,13 @@ async function fetchAndExtract(
 		new URL(url);
 	} catch {
 		return { url, title: "", content: "", error: "Invalid URL" };
+	}
+
+	if (isThreadsPostUrl(url)) {
+		const threadsResult = await extractThreads(url, signal);
+		if (threadsResult) return threadsResult;
+		if (signal?.aborted)
+			return { url, title: "", content: "", error: "Aborted" };
 	}
 
 	const httpResult = await extractViaHttp(url, signal);
